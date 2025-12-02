@@ -224,19 +224,18 @@ if uploaded is not None:
         st.subheader("Raw file (head)")
         st.dataframe(raw_df.head(20), use_container_width=True)
 
-        # Copy STR code from raw *before* dropping column 2.
-        # Assumption: raw column 2 (1-based) contains STR code.
-        # We store it into a technical 'STR' column for downstream use.
+        # === CRITICAL: copy STR FROM RAW COLUMN 2 BEFORE DELETING ANYTHING ===
         if raw_df.shape[1] < 2:
             st.error("Raw file has fewer than 2 columns; cannot extract STR code from column 2.")
         else:
+            # 2nd column (1-based index 2, 0-based index 1) assumed to be STR code
             raw_df["STR"] = raw_df.iloc[:, 1]
 
             # Step 1 & 2
             df1 = step1_delete_columns(raw_df, DROP_COLS_1BASED)
             df2 = step2_reorder_supnam_lpo(df1)
 
-            # Validate columns
+            # Validate columns for ERP format
             missing = [c for c in EXPECTED_AFTER if c not in df2.columns]
             if missing:
                 st.error(f"After Step 1&2, expected columns missing: {missing}. Found: {list(df2.columns)}")
