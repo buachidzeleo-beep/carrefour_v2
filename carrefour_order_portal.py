@@ -1,5 +1,6 @@
-# streamlit app: Carrefour Order Portal (STR-based schedule filtering)
-# Principle: incoming Carrefour order files are NON-changeable. We adapt on our side to upload in proper ERP format.
+# streamlit app: Carrefour Order Portal (STR-first schedule filtering)
+# Principle: incoming Carrefour order files are NON-changeable.
+# We adapt on our side to upload in proper ERP format.
 
 import io
 from typing import List, Dict, Any, Tuple
@@ -11,10 +12,9 @@ import streamlit as st
 st.set_page_config(page_title="Carrefour Order Transformer", layout="wide")
 
 st.title("Carrefour Order Transformer")
-st.caption("Incoming Carrefour orders are **non-changeable**; all adaptation occurs on our side for ERP upload.")
+st.caption("Incoming Carrefour orders are non-changeable; all adaptation is done on our side for ERP upload.")
 
 # Step 1 & 2 config
-# NOTE: we keep logical deletion of raw column 2, but BEFORE that we copy it into a new 'STR' column
 DROP_COLS_1BASED = [1, 2, 4, 5, 6, 7, 9, 11]
 EXPECTED_AFTER = ["SUPNAM", "STR NAME", "BARCODE", "DESC", "QTYORD", "CP", "LPO"]
 
@@ -31,6 +31,8 @@ DAY_LABELS = {
     7: "Sunday",
 }
 
+
+# ---------- Core helpers ----------
 
 def step1_delete_columns(df: pd.DataFrame, drop_1based: List[int]) -> pd.DataFrame:
     """Delete columns by 1-based positions."""
@@ -81,9 +83,9 @@ def _group_blocks(df: pd.DataFrame) -> List[Dict[str, Any]]:
 def _arrange_blocks_no_adjacent_same_store(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Arrange blocks so that no two consecutive blocks have the same store, when possible.
-    Greedy approach:
+    Greedy:
       - At each step, choose the earliest-first_idx block with store != last_store.
-      - If none available, pick the earliest overall (unavoidable adjacency).
+      - If none, pick earliest overall (adjacency unavoidable).
     """
     remaining = sorted(blocks, key=lambda b: b["first_idx"])
     arranged: List[Dict[str, Any]] = []
@@ -112,7 +114,7 @@ def step3_group_and_arrange(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict[s
     return out_df, arranged
 
 
-def load_shop_schedule_by_str(path: str) -> pd.DataFrame:
+def load_schedule_str(path: str) -> pd.DataFrame:
     """
     Load shop schedule from Excel.
     Expected columns: STR, allowed_day (1–7).
@@ -120,7 +122,6 @@ def load_shop_schedule_by_str(path: str) -> pd.DataFrame:
     """
     df = pd.read_excel(path)
 
-    # Normalize column names
     cols_norm = {c: c.strip() for c in df.columns}
     df = df.rename(columns=cols_norm)
 
@@ -131,31 +132,44 @@ def load_shop_schedule_by_str(path: str) -> pd.DataFrame:
             f"Shop schedule (STR-based) missing required columns: {missing}. Found: {list(df.columns)}"
         )
 
-    # Normalize allowed_day to numeric 1–7
     df["allowed_day"] = pd.to_numeric(df["allowed_day"], errors="coerce")
     df = df[df["allowed_day"].between(1, 7)]
 
-    # Normalized STR key
     df["STR_KEY"] = df["STR"].astype(str).str.strip().str.upper()
 
     return df
 
 
-def apply_schedule_filter_by_str(
-    df_orders: pd.DataFrame,
+def filter_raw_by_str_day(
+    raw_df: pd.DataFrame,
     schedule_df: pd.DataFrame,
     selected_day: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Apply day-based filtering using STR code (e.g. G28).
+    Filter RAW orders by STR code and allowed_day BEFORE any other steps.
 
-    df_orders: dataframe AFTER Steps 1–3, must contain column STR (copied from raw second column).
-    schedule_df: output of load_shop_schedule_by_str(...)
-    selected_day: int 1–7
+    raw_df: original Carrefour raw (we do NOT modify it in-place).
+    Schedule: columns STR, allowed_day (1–7).
+    selected_day: int 1–7.
 
-    Returns: (allowed_df, wrong_df), both WITHOUT the technical STR column for ERP export.
+    Returns:
+      raw_allowed, raw_wrong  (both still in raw-format structure).
     """
-    # Build schedule map: STR_KEY -> set of allowed days
+    df = raw_df.copy()
+
+    # Determine where STR code comes from:
+    #  - if there is an explicit 'STR' column — use it
+    #  - else assume 2nd column (index 1) is STR code (Gxx)
+    if "STR" in df.columns:
+        df["STR_TMP"] = df["STR"].astype(str)
+    else:
+        if df.shape[1] < 2:
+            raise ValueError("Raw file has fewer than 2 columns; cannot infer STR from column 2.")
+        df["STR_TMP"] = df.iloc[:, 1].astype(str)
+
+    df["STR_KEY"] = df["STR_TMP"].str.strip().str.upper()
+
+    # Build schedule map
     sched_map: Dict[str, set] = {}
     for _, row in schedule_df.iterrows():
         key = row["STR_KEY"]
@@ -165,14 +179,6 @@ def apply_schedule_filter_by_str(
         day = int(day)
         sched_map.setdefault(key, set()).add(day)
 
-    df = df_orders.copy()
-
-    if "STR" not in df.columns:
-        raise ValueError("Orders dataframe is missing 'STR' column for STR-based filtering.")
-
-    # Build normalized STR key on orders side
-    df["STR_KEY"] = df["STR"].astype(str).str.strip().str.upper()
-
     def is_allowed(str_key: str) -> bool:
         days = sched_map.get(str_key, None)
         if not days:
@@ -181,11 +187,26 @@ def apply_schedule_filter_by_str(
 
     df["ALLOWED_DAY"] = df["STR_KEY"].apply(is_allowed)
 
-    # We drop STR and STR_KEY from export; they are technical only
-    allowed_df = df[df["ALLOWED_DAY"]].drop(columns=["STR", "STR_KEY"]).reset_index(drop=True)
-    wrong_df = df[~df["ALLOWED_DAY"]].drop(columns=["STR", "STR_KEY"]).reset_index(drop=True)
+    raw_allowed = df[df["ALLOWED_DAY"]].drop(columns=["STR_TMP", "STR_KEY", "ALLOWED_DAY"])
+    raw_wrong = df[~df["ALLOWED_DAY"]].drop(columns=["STR_TMP", "STR_KEY", "ALLOWED_DAY"])
 
-    return allowed_df, wrong_df
+    return raw_allowed.reset_index(drop=True), raw_wrong.reset_index(drop=True)
+
+
+def run_full_transform(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict[str, Any]]]:
+    """
+    Apply Steps 1–3 to a given RAW subset (no STR logic here).
+    Returns: (df_after_step1_2, df_final_step3, blocks_meta)
+    """
+    df1 = step1_delete_columns(raw_df, DROP_COLS_1BASED)
+    df2 = step2_reorder_supnam_lpo(df1)
+
+    missing = [c for c in EXPECTED_AFTER if c not in df2.columns]
+    if missing:
+        raise ValueError(f"After Step 1&2, expected columns missing: {missing}. Found: {list(df2.columns)}")
+
+    df3, blocks = step3_group_and_arrange(df2)
+    return df2, df3, blocks
 
 
 def to_excel_download(df: pd.DataFrame) -> bytes:
@@ -196,27 +217,36 @@ def to_excel_download(df: pd.DataFrame) -> bytes:
     return buf.read()
 
 
+# ---------- UI ----------
+
 with st.expander("Instructions", expanded=True):
     st.markdown(
         """
 1. Upload the **Carrefour raw** Excel file.
-2. The app will:
-   - **Step 1:** copy the `STR` code from raw column 2 into a technical `STR` column
-     and then delete columns **1,2,4,5,6,7,9,11**  
-   - **Step 2:** reorder columns so `SUPNAM` is first and `LPO` is last  
-   - **Step 3:** group by (`STR NAME`, `LPO`) and arrange blocks to avoid **adjacent same-store** groups where possible.
-3. Then it applies **day-based filtering** using `config/carrefour_shop_schedule.xlsx`:
-   - schedule columns: `STR` (shop code like G28), `allowed_day` (1–7)
-   - matching is case-insensitive on STR code
-4. Preview results and download:
-   - Full transformed file (Steps 1–3)
-   - Allowed / Wrong-Day files for the selected weekday.
+2. Select delivery day (1–7).
+3. The app will:
+   - Load STR-based schedule from `config/carrefour_shop_schedule.xlsx`
+   - **Immediately filter RAW orders by STR & allowed_day**
+   - On the **allowed** subset:
+        - **Step 1:** delete columns 1,2,4,5,6,7,9,11  
+        - **Step 2:** reorder columns so `SUPNAM` is first and `LPO` is last  
+        - **Step 3:** group by (`STR NAME`, `LPO`) and arrange to avoid adjacent same-store blocks
+   - On the **wrong-day** subset: apply those same Steps 1–3 separately.
+4. Outputs:
+   - Transformed ALLOWED orders (for ERP upload)
+   - Transformed WRONG-DAY orders (for correction)
+   - Optionally, full transformed file ignoring schedule.
         """
     )
 
-uploaded = st.file_uploader("Upload Carrefour raw.xlsx", type=["xlsx"])
+selected_day = st.selectbox(
+    "Select delivery day (1=Mon … 7=Sun)",
+    options=list(DAY_LABELS.keys()),
+    format_func=lambda x: f"{x} — {DAY_LABELS.get(x, '?')}",
+)
 
-keep_intermediate = st.checkbox("Also produce intermediate (after Step 1 & 2)", value=True)
+uploaded = st.file_uploader("Upload Carrefour raw.xlsx", type=["xlsx"])
+keep_full_global = st.checkbox("Also produce FULL transformed file (ignore schedule)", value=False)
 
 if uploaded is not None:
     try:
@@ -224,122 +254,122 @@ if uploaded is not None:
         st.subheader("Raw file (head)")
         st.dataframe(raw_df.head(20), use_container_width=True)
 
-        # === CRITICAL: copy STR FROM RAW COLUMN 2 BEFORE DELETING ANYTHING ===
-        if raw_df.shape[1] < 2:
-            st.error("Raw file has fewer than 2 columns; cannot extract STR code from column 2.")
+        # Load STR-based schedule
+        try:
+            schedule_df = load_schedule_str(CONFIG_SCHEDULE_PATH)
+        except Exception as e:
+            st.error(f"Could not load STR-based shop schedule from '{CONFIG_SCHEDULE_PATH}': {e}")
+            st.stop()
+
+        st.info(
+            f"Using STR-based schedule from '{CONFIG_SCHEDULE_PATH}'. "
+            f"Required columns: STR, allowed_day (1–7). Matching is case-insensitive on STR."
+        )
+
+        # --- 1. Filter raw by STR & day BEFORE any other transformation ---
+        raw_allowed, raw_wrong = filter_raw_by_str_day(raw_df, schedule_df, selected_day)
+
+        st.markdown("### Split by STR & allowed_day (on RAW level)")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**ALLOWED RAW** (by STR & day)")
+            st.write(f"Rows: {len(raw_allowed)}")
+            st.dataframe(raw_allowed.head(20), use_container_width=True)
+        with col_b:
+            st.markdown("**WRONG-DAY RAW** (by STR & day)")
+            st.write(f"Rows: {len(raw_wrong)}")
+            st.dataframe(raw_wrong.head(20), use_container_width=True)
+
+        # --- 2. Transform ALLOWED subset (Steps 1–3) ---
+        st.markdown("---")
+        st.subheader("Transform ALLOWED subset (Steps 1–3)")
+
+        if len(raw_allowed) == 0:
+            st.warning("No rows in ALLOWED subset for the selected day.")
+            df2_allowed = pd.DataFrame()
+            df3_allowed = pd.DataFrame()
+            blocks_allowed = []
         else:
-            # 2nd column (1-based index 2, 0-based index 1) assumed to be STR code
-            raw_df["STR"] = raw_df.iloc[:, 1]
+            try:
+                df2_allowed, df3_allowed, blocks_allowed = run_full_transform(raw_allowed)
+            except Exception as e:
+                st.error(f"Error while transforming ALLOWED subset: {e}")
+                df2_allowed, df3_allowed, blocks_allowed = pd.DataFrame(), pd.DataFrame(), []
 
-            # Step 1 & 2
-            df1 = step1_delete_columns(raw_df, DROP_COLS_1BASED)
-            df2 = step2_reorder_supnam_lpo(df1)
+        if not df3_allowed.empty:
+            block_order_allowed = pd.DataFrame(
+                [{"#": i + 1, "STR NAME": b["store"], "LPO": b["lpo"], "first_row_index": b["first_idx"]}
+                 for i, b in enumerate(blocks_allowed)]
+            )
+            st.markdown("**ALLOWED — block order (STR NAME, LPO)**")
+            st.dataframe(block_order_allowed, use_container_width=True, height=300)
 
-            # Validate columns for ERP format
-            missing = [c for c in EXPECTED_AFTER if c not in df2.columns]
-            if missing:
-                st.error(f"After Step 1&2, expected columns missing: {missing}. Found: {list(df2.columns)}")
+            st.markdown("**ALLOWED — final transformed (head)**")
+            st.dataframe(df3_allowed.head(50), use_container_width=True)
+
+            st.download_button(
+                label="Download ALLOWED — transformed (Steps 1–3)",
+                data=to_excel_download(df3_allowed),
+                file_name="Carrefour_transformed_ALLOWED.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        # --- 3. Transform WRONG-DAY subset (Steps 1–3) ---
+        st.markdown("---")
+        st.subheader("Transform WRONG-DAY subset (Steps 1–3)")
+
+        if len(raw_wrong) == 0:
+            st.info("No WRONG-DAY rows; everything fits the schedule for selected day.")
+            df2_wrong = pd.DataFrame()
+            df3_wrong = pd.DataFrame()
+            blocks_wrong = []
+        else:
+            try:
+                df2_wrong, df3_wrong, blocks_wrong = run_full_transform(raw_wrong)
+            except Exception as e:
+                st.error(f"Error while transforming WRONG-DAY subset: {e}")
+                df2_wrong, df3_wrong, blocks_wrong = pd.DataFrame(), pd.DataFrame(), []
+
+        if not df3_wrong.empty:
+            block_order_wrong = pd.DataFrame(
+                [{"#": i + 1, "STR NAME": b["store"], "LPO": b["lpo"], "first_row_index": b["first_idx"]}
+                 for i, b in enumerate(blocks_wrong)]
+            )
+            st.markdown("**WRONG-DAY — block order (STR NAME, LPO)**")
+            st.dataframe(block_order_wrong, use_container_width=True, height=300)
+
+            st.markdown("**WRONG-DAY — final transformed (head)**")
+            st.dataframe(df3_wrong.head(50), use_container_width=True)
+
+            st.download_button(
+                label="Download WRONG-DAY — transformed (Steps 1–3)",
+                data=to_excel_download(df3_wrong),
+                file_name="Carrefour_transformed_WRONG_DAY.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        # --- 4. Optional: full transformed file ignoring schedule ---
+        if keep_full_global:
+            st.markdown("---")
+            st.subheader("FULL transformed file (ignore schedule, apply Steps 1–3 on all RAW)")
+
+            try:
+                df2_full, df3_full, blocks_full = run_full_transform(raw_df)
+            except Exception as e:
+                st.error(f"Error while transforming FULL RAW file: {e}")
+                df3_full = pd.DataFrame()
             else:
-                st.subheader("After Step 1 & 2 (head)")
-                st.dataframe(df2.head(20), use_container_width=True)
-
-                # Step 3 (group & arrange)
-                df3, arranged_blocks = step3_group_and_arrange(df2)
-
-                # Block order preview
-                block_order_df = pd.DataFrame(
-                    [{"#": i + 1, "STR NAME": b["store"], "LPO": b["lpo"], "first_row_index": b["first_idx"]}
-                     for i, b in enumerate(arranged_blocks)]
-                )
-                st.subheader("Order of (STR NAME, LPO) blocks")
-                st.dataframe(block_order_df, use_container_width=True, height=300)
-
-                # --- Schedule-based day filtering (STR-based) ---
-                st.markdown("---")
-                st.subheader("Day-based filtering by STR code schedule")
-
-                schedule_df = None
-                schedule_error = None
-                try:
-                    schedule_df = load_shop_schedule_by_str(CONFIG_SCHEDULE_PATH)
-                except Exception as e:
-                    schedule_error = str(e)
-
-                if schedule_error:
-                    st.error(
-                        f"Could not load STR-based shop schedule from '{CONFIG_SCHEDULE_PATH}': {schedule_error}"
-                    )
-                else:
-                    st.info(
-                        f"Using STR-based shop schedule from '{CONFIG_SCHEDULE_PATH}'. "
-                        f"Columns: STR, allowed_day (1–7). Matching is case-insensitive on STR."
-                    )
-
-                    # Day selector
-                    selected_day = st.selectbox(
-                        "Select delivery day (1=Mon … 7=Sun)",
-                        options=list(DAY_LABELS.keys()),
-                        format_func=lambda x: f"{x} — {DAY_LABELS.get(x, '?')}",
-                    )
-
-                    # Apply filter using STR code
-                    allowed_df, wrong_df = apply_schedule_filter_by_str(df3, schedule_df, selected_day)
-
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown("**Allowed for selected day**")
-                        st.write(f"Rows: {len(allowed_df)}")
-                        st.dataframe(allowed_df.head(50), use_container_width=True)
-                    with col2:
-                        st.markdown("**WRONG DAY (not allowed for selected day)**")
-                        st.write(f"Rows: {len(wrong_df)}")
-                        st.dataframe(wrong_df.head(50), use_container_width=True)
-
-                    st.markdown("Download by day (STR-based):")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.download_button(
-                            label="Download ALLOWED (by day, STR-based)",
-                            data=to_excel_download(allowed_df),
-                            file_name="Carrefour_transformed_ALLOWED.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        )
-                    with c2:
-                        st.download_button(
-                            label="Download WRONG DAY (STR-based)",
-                            data=to_excel_download(wrong_df),
-                            file_name="Carrefour_transformed_WRONG_DAY.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        )
-
-                st.subheader("Final output (head) — Steps 1–3 (no day filter)")
-                # For ERP-export preview, we hide the technical STR column here as well
-                df3_preview = df3.drop(columns=["STR"]) if "STR" in df3.columns else df3
-                st.dataframe(df3_preview.head(50), use_container_width=True)
-
-                # Downloads for full transformed files (without STR)
-                export_df3 = df3.drop(columns=["STR"]) if "STR" in df3.columns else df3
-                export_df2 = df2.drop(columns=["STR"]) if "STR" in df2.columns else df2
+                st.markdown("**FULL — final transformed (head)**")
+                st.dataframe(df3_full.head(50), use_container_width=True)
 
                 st.download_button(
-                    label="Download TRANSFORMED (Steps 1–3, no STR)",
-                    data=to_excel_download(export_df3),
-                    file_name="Carrefour_transformed.xlsx",
+                    label="Download FULL transformed (Steps 1–3, ignore schedule)",
+                    data=to_excel_download(df3_full),
+                    file_name="Carrefour_transformed_FULL_ignore_schedule.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-                if keep_intermediate:
-                    st.download_button(
-                        label="Download INTERMEDIATE (after Step 1 & 2, no STR)",
-                        data=to_excel_download(export_df2),
-                        file_name="Carrefour_after_step1_2.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-
-                st.success(
-                    "Transformation complete. Raw input is not modified. We copy STR code for internal filtering, "
-                    "then drop it from ERP exports. Day-based filtering is done strictly by STR code."
-                )
+        st.success("Completed: STR-based filtering on RAW first, then Steps 1–3 for allowed and wrong-day subsets.")
 
     except Exception as e:
         st.error(f"Error: {e}")
