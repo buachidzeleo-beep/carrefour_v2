@@ -235,13 +235,13 @@ if uploaded:
                 df_allowed,
                 f"Carrefour - დაშვებული შეკვეთები - {today}.xlsx"
             )
-            st.download_button("სწორი დღე ("შეკვეთა, ასათვირთი", data=file_bytes, file_name=fname)
+            st.download_button("Download allowed", data=file_bytes, file_name=fname)
 
             file_bytes2, fname2 = to_excel(
                 df_wrong,
                 f"Carrefour - არასწორი დღე - {today}.xlsx"
             )
-            st.download_button("არასწორი დღე", data=file_bytes2, file_name=fname2)
+            st.download_button("Download wrong-day", data=file_bytes2, file_name=fname2)
 
     except Exception as e:
         st.error(f"Error: {e}")
