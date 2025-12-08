@@ -82,7 +82,7 @@ def _arrange_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return arranged
 
 
-def step3_group_and_arrange(df: pd.DataFrame):
+def step3_group_and_arrange(df: pd.DataFrame) -> pd.DataFrame:
     blocks = _group_blocks(df)
     arranged = _arrange_blocks(blocks)
     out_df = pd.concat([b["df"] for b in arranged], axis=0).reset_index(drop=True)
@@ -103,6 +103,11 @@ def load_schedule(path: str) -> pd.DataFrame:
 
 
 def filter_raw_by_str_day(raw_df: pd.DataFrame, schedule_df: pd.DataFrame, selected_day: int):
+    """
+    New logic:
+    - If STR is in schedule → apply day filter (allowed_day).
+    - If STR is NOT in schedule → auto-allowed (no filtering).
+    """
     df = raw_df.copy()
 
     # identify STR code source
@@ -113,18 +118,26 @@ def filter_raw_by_str_day(raw_df: pd.DataFrame, schedule_df: pd.DataFrame, selec
 
     df["STR_KEY"] = df["STR_TMP"].str.strip().str.upper()
 
+    # schedule map: STR_KEY -> set(days)
     sched_map: Dict[str, set] = {}
     for _, r in schedule_df.iterrows():
         sched_map.setdefault(r["STR_KEY"], set()).add(int(r["allowed_day"]))
 
-    df["ALLOWED"] = df["STR_KEY"].apply(lambda x: selected_day in sched_map.get(x, set()))
+    def is_allowed(str_key: str) -> bool:
+        days = sched_map.get(str_key)
+        if days is None:
+            # not in schedule → go without filtration → allowed
+            return True
+        return selected_day in days
+
+    df["ALLOWED"] = df["STR_KEY"].apply(is_allowed)
 
     raw_allowed = df[df["ALLOWED"]].drop(columns=["STR_TMP", "STR_KEY", "ALLOWED"])
     raw_wrong = df[~df["ALLOWED"]].drop(columns=["STR_TMP", "STR_KEY", "ALLOWED"])
     return raw_allowed.reset_index(drop=True), raw_wrong.reset_index(drop=True)
 
 
-def transform_steps(raw_subset: pd.DataFrame):
+def transform_steps(raw_subset: pd.DataFrame) -> pd.DataFrame:
     if raw_subset.empty:
         return pd.DataFrame()
 
@@ -186,12 +199,11 @@ if uploaded:
         df_wrong = transform_steps(raw_wrong)
 
         # -----------------------------------------
-        # STORES WITHOUT ORDERS
+        # STORES WITHOUT ORDERS (only from schedule)
         # -----------------------------------------
         all_str_in_raw = set(raw_df.iloc[:, 1].astype(str).str.upper())
         all_str_in_schedule = set(schedule_df["STR_KEY"])
         missing_stores = sorted(list(all_str_in_schedule - all_str_in_raw))
-
         missing_df = pd.DataFrame({"STR (no order today)": missing_stores})
 
         # -----------------------------------------
